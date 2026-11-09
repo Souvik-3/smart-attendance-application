@@ -8,5 +8,5 @@
 /captures/
 .externalNativeBuild/
 .cxx/
-# Firebase config contains your project keys; commit it only to private repos.
+# Firebase config contains the project keys; 
 /app/google-services.json
