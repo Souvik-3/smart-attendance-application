@@ -1,0 +1,236 @@
+rules_version = '2';
+
+// FacePrint Attend - Cloud Firestore security rules.
+//
+// The free Spark plan has no Cloud Functions, so these rules ARE the server-side enforcement.
+// They must stay in sync with attendance/AttendanceManager.java and firebase/FirestorePaths.java.
+//
+//   teacherAllowlist/{email}                        console-managed; doc exists => teacher
+//   users/{uid}                                     student profile  {name, roll, email, createdAt}
+//   rolls/{ROLL}                                    roll uniqueness  {uid}
+//   courses/{courseId}                              {code, name, teacherUid, teacherEmail, createdAt}
+//   courses/{courseId}/roster/{studentKey}          studentKey = uid, or "manual-ROLL"
+//   sessions/{sessionId}                            {courseId, courseCode, courseName, teacherUid, code,
+//                                                    sessionDate, startTime, startedAt, expiresAt, endedAt, active}
+//   sessionCodes/{CODE}                             code -> session lookup (create-only => unique codes)
+//   sessions/{sessionId}/attendance/{studentKey}    one record per student per session
+//   sessions/{sessionId}/auditLogs/{auditId}        append-only teacher corrections
+//
+// Deploy:  firebase deploy --only firestore:rules
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------ helpers
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function isTeacher() {
+      return signedIn() && exists(/databases/$(database)/documents/teacherAllowlist/$(myEmail()));
+    }
+    function sessionData(sessionId) {
+      return get(/databases/$(database)/documents/sessions/$(sessionId)).data;
+    }
+    function ownsSession(sessionId) {
+      return signedIn() && sessionData(sessionId).teacherUid == request.auth.uid;
+    }
+    function ownsCourse(courseId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/courses/$(courseId)).data.teacherUid == request.auth.uid;
+    }
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function validRoll(roll) {
+      return roll is string && roll.matches('^[A-Z0-9-]{1,20}$');
+    }
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ------------------------------------------------------------------ teacher allowlist
+    // Managed by the admin in the Firebase console (document id = lowercase email).
+    match /teacherAllowlist/{email} {
+      allow get: if request.auth != null && email == myEmail();
+      allow list, write: if false;
+    }
+
+    // ------------------------------------------------------------------ student profiles
+    match /users/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'roll', 'email', 'createdAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 3
+        && validRoll(request.resource.data.roll)
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time
+        // the roll must be claimed by this account (same batch or earlier)
+        && getAfter(/databases/$(database)/documents/rolls/$(request.resource.data.roll)).data.uid == uid;
+      // Only the name may change; roll and email are permanent.
+      allow update: if signedIn() && request.auth.uid == uid
+        && changed().hasOnly(['name'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 3;
+      allow delete: if false;
+    }
+
+    // Roll-number registry: one roll belongs to exactly one account (create-only).
+    match /rolls/{roll} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && validRoll(roll)
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------------ courses + roster
+    match /courses/{courseId} {
+      allow read: if signedIn() && resource.data.teacherUid == request.auth.uid;
+      allow create: if isTeacher()
+        && request.resource.data.teacherUid == request.auth.uid
+        && request.resource.data.code is string && request.resource.data.code.size() > 0
+        && request.resource.data.name is string && request.resource.data.name.size() > 0;
+      allow update: if signedIn() && resource.data.teacherUid == request.auth.uid
+        && changed().hasOnly(['name']);
+      allow delete: if false;
+
+      match /roster/{studentKey} {
+        // The course teacher manages the roster.
+        allow read, write: if ownsCourse(courseId);
+        // A student adds/refreshes their own entry when checking in.
+        allow create, update: if signedIn()
+          && studentKey == request.auth.uid
+          && request.resource.data.studentUid == request.auth.uid
+          && request.resource.data.roll == myProfile().roll
+          && request.resource.data.email == request.auth.token.email;
+      }
+    }
+
+    // ------------------------------------------------------------------ sessions
+    match /sessions/{sessionId} {
+      // Students read the session after looking its code up.
+      allow get: if signedIn();
+      allow list: if signedIn() && resource.data.teacherUid == request.auth.uid;
+      allow create: if isTeacher()
+        && request.resource.data.teacherUid == request.auth.uid
+        && ownsCourse(request.resource.data.courseId)
+        && request.resource.data.active == true
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.expiresAt is timestamp;
+      allow update: if signedIn() && resource.data.teacherUid == request.auth.uid
+        && changed().hasOnly(['code', 'expiresAt', 'active', 'endedAt'])
+        && request.resource.data.teacherUid == resource.data.teacherUid;
+      allow delete: if false;
+
+      // ---------------------------------------------------------------- attendance
+      match /attendance/{studentKey} {
+
+        function studentCheckIn() {
+          let d = request.resource.data;
+          let s = sessionData(sessionId);
+          let me = myProfile();
+          return signedIn()
+            && studentKey == request.auth.uid
+            && d.studentUid == request.auth.uid
+            && d.roll == me.roll
+            && d.email == request.auth.token.email
+            // open session, correct code, not expired (server clock)
+            && s.active == true
+            && d.sessionId == sessionId
+            && d.sessionCode == s.code
+            && d.courseId == s.courseId
+            && request.time < s.expiresAt
+            // trusted server time, no teacher-only fields
+            && d.markedAt == request.time
+            && d.updatedAt == request.time
+            && d.source == 'STUDENT_APP'
+            && d.manualOverride == false
+            && !('lastAuditId' in d)
+            // PRESENT needs both checks; the exception flow submits PENDING for teacher approval
+            && (d.status == 'PENDING'
+                || (d.status == 'PRESENT' && d.faceCheckPassed == true && d.fingerprintPassed == true));
+        }
+
+        function auditMatches(newStatus, oldStatus) {
+          let a = getAfter(/databases/$(database)/documents/sessions/$(sessionId)/auditLogs/$(request.resource.data.lastAuditId)).data;
+          return a.studentKey == studentKey
+            && a.teacherUid == request.auth.uid
+            && a.newStatus == newStatus
+            && a.oldStatus == oldStatus;
+        }
+
+        function teacherCreate() {
+          let d = request.resource.data;
+          return ownsSession(sessionId)
+            && d.sessionId == sessionId
+            && d.markedAt == request.time
+            && d.updatedAt == request.time
+            && (
+              // manual mark of a student with no record: must be logged in the same write
+              (d.source == 'TEACHER_MANUAL' && d.manualOverride == true
+                && d.status in ['PRESENT', 'ABSENT'] && auditMatches(d.status, 'NONE'))
+              // automatic ABSENT for roster students when the session is ended
+              || (d.source == 'AUTO_CLOSE' && d.status == 'ABSENT' && d.manualOverride == false
+                && !('lastAuditId' in d))
+            );
+        }
+
+        function teacherUpdate() {
+          return ownsSession(sessionId)
+            && changed().hasOnly(['status', 'manualOverride', 'markedBy', 'lastAuditId', 'updatedAt'])
+            && request.resource.data.status in ['PRESENT', 'ABSENT']
+            && request.resource.data.status != resource.data.status
+            && request.resource.data.manualOverride == true
+            && request.resource.data.updatedAt == request.time
+            && auditMatches(request.resource.data.status, resource.data.status);
+        }
+
+        // resource == null lets a transaction check "does my record exist yet?"
+        allow get: if signedIn()
+          && (resource == null || resource.data.studentUid == request.auth.uid || ownsSession(sessionId));
+        allow list: if ownsSession(sessionId);
+        // create-only for students => the second check-in of the same student is rejected
+        allow create: if studentCheckIn() || teacherCreate();
+        allow update: if teacherUpdate();
+        allow delete: if false;
+      }
+
+      // ---------------------------------------------------------------- audit logs (append-only)
+      match /auditLogs/{auditId} {
+        allow read: if ownsSession(sessionId);
+        allow create: if ownsSession(sessionId)
+          && request.resource.data.teacherUid == request.auth.uid
+          && request.resource.data.newStatus in ['PRESENT', 'ABSENT']
+          && request.resource.data.oldStatus is string
+          && request.resource.data.reason is string
+          && request.resource.data.reason.trim().size() >= 5
+          && request.resource.data.changedAt == request.time
+          // the attendance record must point at this log entry after the write
+          && getAfter(/databases/$(database)/documents/sessions/$(sessionId)/attendance/$(request.resource.data.studentKey)).data.lastAuditId == auditId;
+        allow update, delete: if false;
+      }
+    }
+
+    // A student's own records across all sessions (collection-group query on "attendance").
+    match /{path=**}/attendance/{studentKey} {
+      allow list: if signedIn() && resource.data.studentUid == request.auth.uid;
+    }
+
+    // ------------------------------------------------------------------ session codes
+    match /sessionCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      // create-only: a code already in use is rejected (the app retries with a new code)
+      allow create: if isTeacher()
+        && request.resource.data.teacherUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.teacherUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/sessions/$(request.resource.data.sessionId)).data.code == code;
+      allow delete: if signedIn() && resource.data.teacherUid == request.auth.uid;
+      allow update: if false;
+    }
+  }
+}
